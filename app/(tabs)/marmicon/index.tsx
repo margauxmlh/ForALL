@@ -1,0 +1,21 @@
+import { StyleSheet, Text, View } from 'react-native';
+
+export default function MarmiconScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.text}>Marmicon screen</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  text: {
+    fontSize: 18,
+    fontWeight: '600',
+  },
+});
