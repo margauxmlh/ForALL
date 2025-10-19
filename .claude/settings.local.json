@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"C:\\Users\\nicol\\Documents\\Dev\\ForALL\" /s /b)",
+      "Bash(findstr:*)",
+      "Bash(npm install)",
+      "mcp__supabase__list_tables",
+      "mcp__supabase__apply_migration",
+      "mcp__supabase__get_project_url",
+      "mcp__supabase__get_advisors",
+      "mcp__supabase__execute_sql",
+      "mcp__supabase__get_logs",
+      "Bash(xargs cat)",
+      "Bash(yarn remove nativewind tailwindcss)",
+      "mcp__supabase__generate_typescript_types"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

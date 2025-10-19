@@ -6,6 +6,9 @@ import { query, run, transaction, TABLE_NAME as LOCAL_ITEMS_TABLE } from '../db/
 const REMOTE_TABLE = 'items';
 const LOCAL_TABLE = LOCAL_ITEMS_TABLE;
 
+// Shared user ID for both users - no authentication needed
+const SHARED_USER_ID = 'shared';
+
 type SupabaseItemRow = {
   id: string;
   user_id: string | null;
@@ -82,20 +85,6 @@ const mapToLocalValues = (item: SupabaseItemRow) => [
   item.updated_at ?? null,
 ];
 
-const fetchUserId = async (): Promise<string | null> => {
-  try {
-    const { data, error } = await supabase.auth.getSession();
-    if (error) {
-      console.warn('[FridgeService] Unable to get session', error);
-      return null;
-    }
-    return data.session?.user?.id ?? null;
-  } catch (error) {
-    console.warn('[FridgeService] Failed to fetch session', error);
-    return null;
-  }
-};
-
 const generateLocalId = () => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -127,9 +116,9 @@ const deleteLocalItem = async (id: string) => {
   await run(`DELETE FROM ${LOCAL_TABLE} WHERE id = ?`, [id]);
 };
 
-const replaceLocalItemsForUser = async (userId: string, items: SupabaseItemRow[]) => {
+const replaceLocalItems = async (items: SupabaseItemRow[]) => {
   await transaction(async () => {
-    await run(`DELETE FROM ${LOCAL_TABLE} WHERE user_id = ? OR user_id IS NULL`, [userId]);
+    await run(`DELETE FROM ${LOCAL_TABLE}`);
     for (const item of items) {
       await upsertLocalItem(item);
     }
@@ -157,22 +146,17 @@ const handlePostgrestError = (context: string, error: PostgrestError | null) => 
 export async function getItems(): Promise<FridgeItem[]> {
   const localItems = await getLocalItemsFromDb();
 
-  const userId = await fetchUserId();
-  if (!userId) {
-    return localItems;
-  }
-
   try {
     const { data, error } = await supabase
       .from<SupabaseItemRow>(REMOTE_TABLE)
       .select('*')
-      .eq('user_id', userId)
+      .eq('user_id', SHARED_USER_ID)
       .order('expiry_date', { ascending: true, nullsFirst: false });
 
     handlePostgrestError('Failed to fetch remote items', error);
 
     const remoteItems = data ?? [];
-    await replaceLocalItemsForUser(userId, remoteItems);
+    await replaceLocalItems(remoteItems);
     return remoteItems.map(toFridgeItem);
   } catch (error) {
     console.warn('[FridgeService] Remote sync failed, using local cache', error);
@@ -181,13 +165,36 @@ export async function getItems(): Promise<FridgeItem[]> {
 }
 
 export async function addItem(input: FridgeItemInput): Promise<FridgeItem> {
-  const userId = await fetchUserId();
   const now = new Date().toISOString();
+  const payload = { ...buildPayload(input), user_id: SHARED_USER_ID };
 
-  if (!userId) {
+  try {
+    const { data, error } = await supabase.from<SupabaseItemRow>(REMOTE_TABLE).insert(payload).select().single();
+    handlePostgrestError('Failed to create item', error);
+
+    if (!data) {
+      throw new Error('Unable to create item: Supabase did not return any data.');
+    }
+
+    await upsertLocalItem(data);
+
+    // Schedule expiry reminders if expiry date is set
+    if (data.expiry_date) {
+      await scheduleExpiryReminders({
+        id: data.id,
+        name: data.name,
+        expiryDate: data.expiry_date,
+      });
+    }
+
+    return toFridgeItem(data);
+  } catch (error) {
+    // Fallback to local-only if Supabase fails
+    console.warn('[FridgeService] Remote insert failed, saving locally only', error);
+
     const localRow: SupabaseItemRow = {
       id: generateLocalId(),
-      user_id: null,
+      user_id: SHARED_USER_ID,
       name: input.name,
       barcode: input.barcode ?? null,
       quantity: input.quantity ?? null,
@@ -199,39 +206,69 @@ export async function addItem(input: FridgeItemInput): Promise<FridgeItem> {
       created_at: now,
       updated_at: now,
     };
+
     await upsertLocalItem(localRow);
+
+    if (localRow.expiry_date) {
+      await scheduleExpiryReminders({
+        id: localRow.id,
+        name: localRow.name,
+        expiryDate: localRow.expiry_date,
+      });
+    }
+
     return toFridgeItem(localRow);
   }
-
-  const payload = { ...buildPayload(input), user_id: userId };
-
-  const { data, error } = await supabase.from<SupabaseItemRow>(REMOTE_TABLE).insert(payload).select().single();
-  handlePostgrestError('Failed to create item', error);
-
-  if (!data) {
-    throw new Error('Unable to create item: Supabase did not return any data.');
-  }
-
-  await upsertLocalItem(data);
-  return toFridgeItem(data);
 }
 
 export async function updateItem(item: FridgeItem): Promise<FridgeItem> {
-  const userId = await fetchUserId();
   const existing = await getLocalItem(item.id);
+
+  if (!existing) {
+    throw new Error("Aliment introuvable dans l'inventaire local.");
+  }
 
   const payload = buildPayload(item);
 
-  if (!userId) {
-    if (!existing) {
-      throw new Error("Aliment introuvable dans l'inventaire local.");
+  try {
+    const { data, error } = await supabase
+      .from<SupabaseItemRow>(REMOTE_TABLE)
+      .update(payload)
+      .eq('id', item.id)
+      .eq('user_id', SHARED_USER_ID)
+      .select()
+      .single();
+    handlePostgrestError('Failed to update item', error);
+
+    if (!data) {
+      throw new Error('Unable to update item: Supabase did not return any data.');
     }
+
+    await upsertLocalItem(data);
+
+    const previousExpiry = existing?.expiry_date ?? null;
+    const newExpiry = data.expiry_date ?? null;
+    if (previousExpiry !== newExpiry) {
+      await cancelExpiryReminders(item.id);
+      if (newExpiry) {
+        await scheduleExpiryReminders({
+          id: data.id,
+          name: data.name,
+          expiryDate: newExpiry,
+        });
+      }
+    }
+
+    return toFridgeItem(data);
+  } catch (error) {
+    // Fallback to local-only update
+    console.warn('[FridgeService] Remote update failed, updating locally only', error);
 
     const now = new Date().toISOString();
     const updated: SupabaseItemRow = {
       ...existing,
       ...payload,
-      user_id: existing.user_id ?? null,
+      user_id: SHARED_USER_ID,
       created_at: existing.created_at ?? existing.updated_at ?? now,
       updated_at: now,
     };
@@ -253,65 +290,29 @@ export async function updateItem(item: FridgeItem): Promise<FridgeItem> {
 
     return toFridgeItem(updated);
   }
-
-  const { data, error } = await supabase
-    .from<SupabaseItemRow>(REMOTE_TABLE)
-    .update(payload)
-    .eq('id', item.id)
-    .eq('user_id', userId)
-    .select()
-    .single();
-  handlePostgrestError('Failed to update item', error);
-
-  if (!data) {
-    throw new Error('Unable to update item: Supabase did not return any data.');
-  }
-
-  await upsertLocalItem(data);
-
-  const previousExpiry = existing?.expiry_date ?? null;
-  const newExpiry = data.expiry_date ?? null;
-  if (previousExpiry !== newExpiry) {
-    await cancelExpiryReminders(item.id);
-    if (newExpiry) {
-      await scheduleExpiryReminders({
-        id: data.id,
-        name: data.name,
-        expiryDate: newExpiry,
-      });
-    }
-  }
-
-  return toFridgeItem(data);
 }
 
 export async function deleteItem(id: string): Promise<void> {
-  const userId = await fetchUserId();
+  try {
+    const { error } = await supabase.from(REMOTE_TABLE).delete().eq('id', id).eq('user_id', SHARED_USER_ID);
+    handlePostgrestError('Failed to delete item', error);
 
-  if (!userId) {
     await deleteLocalItem(id);
     await cancelExpiryReminders(id);
-    return;
+  } catch (error) {
+    // Fallback to local-only delete
+    console.warn('[FridgeService] Remote delete failed, deleting locally only', error);
+    await deleteLocalItem(id);
+    await cancelExpiryReminders(id);
   }
-
-  const { error } = await supabase.from(REMOTE_TABLE).delete().eq('id', id).eq('user_id', userId);
-  handlePostgrestError('Failed to delete item', error);
-
-  await deleteLocalItem(id);
-  await cancelExpiryReminders(id);
 }
 
 export async function subscribeRealtime(callback: (items: FridgeItem[]) => void) {
-  const userId = await fetchUserId();
-  if (!userId) {
-    return () => undefined;
-  }
-
   const channel = supabase
-    .channel(`public:${REMOTE_TABLE}:${userId}`)
+    .channel(`public:${REMOTE_TABLE}:${SHARED_USER_ID}`)
     .on(
       'postgres_changes',
-      { event: '*', schema: 'public', table: REMOTE_TABLE, filter: `user_id=eq.${userId}` },
+      { event: '*', schema: 'public', table: REMOTE_TABLE, filter: `user_id=eq.${SHARED_USER_ID}` },
       async (payload) => {
         try {
           if (payload.eventType === 'DELETE' && payload.old?.id) {
